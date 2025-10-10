@@ -98,6 +98,17 @@ class BoxParam:
     R: Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]  # 3x3 旋转矩阵（行向量为轴）
     extents: Tuple[float, float, float]  # 沿主轴长度 (lx, ly, lz)
 
+@dataclass
+class WaveRiderParam:
+    # center: Tuple[float, float, float]
+    # axis: Tuple[float, float, float]
+    # radius: float
+    # height: float
+    # wave_amplitude: float
+    # wave_length: float
+    # wave_phase: float
+    pass
+
 
 def fit_sphere(points: np.ndarray) -> Tuple[SphereParam, float]:
     """解析法拟合球: x^2+y^2+z^2 + ax + by + cz + d = 0"""
