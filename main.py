@@ -141,48 +141,144 @@ def fit_box(points: np.ndarray) -> Tuple[BoxParam, float]:
     # 最近面距离（法向方向）：min_i | |xi| - ext_i/2 |
     half = ext * 0.5
     absx = np.abs(X)
-    d_face = np.min(np.abs(absx - half), axis=1)
-    residual = float(d_face.mean())
+    d_shell = np.max(np.abs(absx - half), axis=1)
+    residual = float(np.mean(np.abs(d_shell)))
     param = BoxParam(tuple(c.tolist()), tuple(map(tuple, R)), tuple(ext.tolist()))
     return param, residual
 
 # ----------------------- 模型选择与 JSON -----------------------
+def _shape_metrics(points: np.ndarray):
+    c = points.mean(axis=0)
+    X = points - c
+    # AABB
+    mins = X.min(axis=0); maxs = X.max(axis=0)
+    ext = maxs - mins
+    # 各向异性：最大/最小边
+    ex, ey, ez = ext
+    eps = 1e-12
+    aniso_aabb = (ext.max() + eps) / (ext.min() + eps)
 
-def choose_best_model(points: np.ndarray) -> Dict[str, Any]:
+    # PCA 奇异值
+    U, S, Vt = np.linalg.svd(X, full_matrices=False)  # S ~ sqrt(eigvals of cov up to scale)
+    s1, s2, s3 = S
+    aniso_pca12 = (s1 + eps) / (s2 + eps)
+    aniso_pca23 = (s2 + eps) / (s3 + eps)
+
+    # 球一致性：到中心距离的变异系数 CoV
+    dist = np.linalg.norm(X, axis=1)
+    cov_sphere = (dist.std() + eps) / (dist.mean() + eps)
+
+    # 圆柱一致性：沿主轴投影 t 与径向 r
+    axis = Vt[0]  # 主轴
+    t = X @ axis
+    radial = np.linalg.norm(X - np.outer(t, axis), axis=1)
+    # 去掉两端 5%（端盖）
+    q1, q99 = np.percentile(t, [5, 95])
+    mask_side = (t >= q1) & (t <= q99)
+    cov_cyl = (radial[mask_side].std() + eps) / (radial[mask_side].mean() + eps)
+    height = float(t.max() - t.min())
+    radius_med = float(np.median(radial[mask_side])) if mask_side.any() else float(np.median(radial))
+    hw_ratio = (height + eps) / (2.0 * radius_med + eps)
+
+    return {
+        "extents": ext,
+        "aniso_aabb": float(aniso_aabb),
+        "aniso_pca12": float(aniso_pca12),
+        "aniso_pca23": float(aniso_pca23),
+        "cov_sphere": float(cov_sphere),
+        "cov_cyl": float(cov_cyl),
+        "height": float(height),
+        "radius_med": float(radius_med),
+        "hw_ratio": float(hw_ratio),  # 高度/直径
+        "axis": axis
+    }
+
+
+def _adjust_scores_by_priors(points: np.ndarray, raw_scores: dict):
+    m = _shape_metrics(points)
+    scores = raw_scores.copy()
+
+    # --- Sphere 先验 ---
+    # 球应当：到心距离 CoV 很小 & AABB 各向同性
+    if m["cov_sphere"] > 0.07 or m["aniso_aabb"] > 1.15:
+        scores["sphere"] *= 1.8  # 惩罚
+    else:
+        scores["sphere"] *= 0.9  # 合理就给点偏好
+
+    # --- Cylinder 先验 ---
+    # 圆柱应当：半径 CoV 小、长高比合适、PCA 第一特征显著
+    if m["cov_cyl"] > 0.12 or m["hw_ratio"] < 0.8 or m["aniso_pca12"] < 1.2:
+        scores["cylinder"] *= 1.4
+    else:
+        scores["cylinder"] *= 0.9
+
+    # --- Cuboid 先验 ---
+    # 盒子：三个主轴差异较明显（不全接近），且不是接近球体的等边
+    near_cube = (m["aniso_aabb"] < 1.12)
+    axial_separation_ok = (m["aniso_pca12"] > 1.08) or (m["aniso_pca23"] > 1.08)
+    if near_cube and (m["cov_sphere"] < 0.06):  # 很像球就惩罚盒子
+        scores["cuboid"] *= 1.5
+    elif not axial_separation_ok:
+        scores["cuboid"] *= 1.2
+    else:
+        scores["cuboid"] *= 0.95
+
+    return scores, m
+
+
+def choose_best_model(points: np.ndarray, prefer: str | None = None) -> Dict[str, Any]:
     sp, r_s = fit_sphere(points)
     cy, r_c = fit_cylinder(points)
     bx, r_b = fit_box(points)
 
-    # 用数据尺度归一化后比较更稳健
+    # 归一化后分数（你原来怎么做就怎么做；这里示例用 std 尺度）
     scale = np.linalg.norm(points.std(axis=0)) + 1e-9
     scores = {
         'sphere': r_s / scale,
         'cylinder': r_c / scale,
-        'box': r_b / scale,
+        'cuboid': r_b / scale,
     }
+
+    # 可选：轻微惩罚某些更“宽容”的模型，防止一边倒（按需保留/调整）
+    # scores['cuboid']      *= 1.05   # 盒子不再过度占优
+    # scores['cylinder'] *= 1.00   # 也可微调圆柱
+    # scores['sphere']   *= 1.00
+
+    # 先取原始最优
     best = min(scores, key=scores.get)
 
+    # 领先阈值：最优与次优差距不足 8% 时，允许 --prefer 覆盖
+    sorted_vals = sorted((v, k) for k, v in scores.items())
+    best_val, best_key = sorted_vals[0]
+    second_val, second_key = sorted_vals[1]
+    lead_ratio = (second_val + 1e-12) / (best_val + 1e-12)  # 次优/最优
+
+    if prefer in scores and lead_ratio < 1.08:
+        # 分差接近时采用用户偏好
+        best = prefer
+
+    # 组装返回 payload（保持你原来的结构）
     if best == 'sphere':
-        payload = {
-            'type': 'sphere',
-            'params': asdict(sp),
-            'fit': {'score': scores['sphere']}
-        }
+        payload = {'type': 'sphere', 'params': asdict(sp), 'fit': {'score': scores['sphere'], 'all': scores}}
     elif best == 'cylinder':
-        payload = {
-            'type': 'cylinder',
-            'params': asdict(cy),
-            'fit': {'score': scores['cylinder']}
-        }
+        payload = {'type': 'cylinder', 'params': asdict(cy), 'fit': {'score': scores['cylinder'], 'all': scores}}
     else:
-        payload = {
-            'type': 'box',
-            'params': asdict(bx),
-            'fit': {'score': scores['box']}
-        }
+        payload = {'type': 'cuboid', 'params': asdict(bx), 'fit': {'score': scores['cuboid'], 'all': scores}}
+
     return payload
 
+
+
 # ----------------------- 基于参数生成网格 -----------------------
+def _to_4x4(M):
+    M = np.asarray(M, dtype=float)
+    if M.shape == (4, 4):
+        return M
+    if M.shape == (3, 3):
+        T = np.eye(4)
+        T[:3, :3] = M
+        return T
+    raise ValueError(f"Expected 3x3 or 4x4 matrix, got {M.shape}")
 
 def mesh_from_params(spec: Dict[str, Any]) -> trimesh.Trimesh:
     t = spec['type']
@@ -201,22 +297,22 @@ def mesh_from_params(spec: Dict[str, Any]) -> trimesh.Trimesh:
         radius = float(p['radius'])
         height = float(p['height'])
         m = trimesh.creation.cylinder(radius=radius, height=height, sections=128)
-        # 对齐 z 轴到目标轴
-        R = trimesh.geometry.align_vectors(np.array([0.0, 0.0, 1.0]), axis)
-        T = np.eye(4)
-        T[:3, :3] = R
+
+        # 对齐 z 轴到目标轴：align_vectors 返回 4x4
+        M = trimesh.geometry.align_vectors(np.array([0.0, 0.0, 1.0]), axis)
+        T = _to_4x4(M)
         m.apply_transform(T)
         m.apply_translation(center)
         return m
 
-    if t == 'box':
+    # —— 修改 mesh_from_params 中的盒子分支（兼容 R 既可能是 3x3 也可能是 4x4）：
+    if t == 'cuboid':
         center = np.array(p['center'])
-        R = np.array(p['R'], dtype=float)
+        R = _to_4x4(p['R'])   # 这里兼容 3x3 / 4x4
         ext = np.array(p['extents'], dtype=float)
         m = trimesh.creation.box(extents=ext)
-        T = np.eye(4)
-        T[:3, :3] = R
-        T[:3, 3] = center
+        T = R.copy()
+        T[:3, 3] = center     # 再加上平移
         m.apply_transform(T)
         return m
 
@@ -304,14 +400,36 @@ def parse_kv_updates(kvs):
 
 def cmd_fit(args):
     pts, mesh = load_points_from_stl(args.stl, n_samples=args.samples)
-    spec = choose_best_model(pts)
+
+    # 1) 强制类型：直接拟合对应形状并组装 spec
+    if getattr(args, 'force_type', None):
+        forced = args.force_type
+        print(f"[INFO] 强制拟合类型: {forced}")
+        if forced == 'sphere':
+            param, _ = fit_sphere(pts)
+        elif forced == 'cylinder':
+            param, _ = fit_cylinder(pts)
+        else:
+            param, _ = fit_box(pts)
+        spec = {
+            'type': forced,
+            'params': asdict(param),
+            'fit': {'forced': True}
+        }
+
+    else:
+        # 2) 正常自动判别，但允许 --prefer 在分差接近时生效
+        spec = choose_best_model(pts, prefer=getattr(args, 'prefer', None))
+
     if args.json:
         with open(args.json, 'w', encoding='utf-8') as f:
             json.dump(spec, f, ensure_ascii=False, indent=2)
         print(f"Saved params → {args.json}")
+
     if args.preview:
         fitted = mesh_from_params(spec)
         preview_scene(mesh, fitted, smooth=not getattr(args, 'flat', False))
+
 
 
 def cmd_gen(args):
@@ -435,25 +553,29 @@ def cmd_gui(args):
     scene.scene = rendering.Open3DScene(w.renderer)
     scene.scene.set_background([1,1,1,1])
 
-    mat = rendering.MaterialRecord()
-    mat.shader = "defaultLit"
+    mat_mesh = rendering.MaterialRecord()
+    mat_mesh.shader = "defaultLit"   # 三角网格用带光照的
+
+    mat_line = rendering.MaterialRecord()
+    mat_line.shader = "unlitLine"    # 线框要用 unlitLine 才不会缺属性
+    mat_line.line_width = 2.0        # 线宽可调
 
     # 添加几何体
     if orig_mesh is not None:
         o3 = _trimesh_to_o3d(orig_mesh)
-        scene.scene.add_geometry("orig", o3, mat)
+        scene.scene.add_geometry("orig", o3, mat_mesh)
         scene.scene.show_geometry("orig", True)
 
     tri_o3 = _trimesh_to_o3d(tri)
-    scene.scene.add_geometry("fit", tri_o3, mat)
+    scene.scene.add_geometry("fit", tri_o3, mat_mesh)
 
     # 坐标轴与 bbox
     size_hint = float(np.linalg.norm(tri.bounding_box.extents) if hasattr(tri, 'bounding_box') else 1.0)
     axes = _make_axes(max(size_hint*0.25, 1e-3))
-    scene.scene.add_geometry("axes", axes, mat)
+    scene.scene.add_geometry("axes", axes, mat_line)
 
     bbox_lines = _bbox_lines_o3d(tri)
-    scene.scene.add_geometry("bbox", bbox_lines, mat)
+    scene.scene.add_geometry("bbox", bbox_lines, mat_line)
 
     # 相机
     bounds = scene.scene.bounding_box
@@ -469,12 +591,12 @@ def cmd_gui(args):
         new_tri = _spec_to_trimesh(spec)
         new_o3 = _trimesh_to_o3d(new_tri)
         scene.scene.remove_geometry("fit")
-        scene.scene.add_geometry("fit", new_o3, mat)
+        scene.scene.add_geometry("fit", new_o3, mat_mesh)
         tri_o3 = new_o3
         # bbox 更新
         scene.scene.remove_geometry("bbox")
         bbox_lines = _bbox_lines_o3d(new_tri)
-        scene.scene.add_geometry("bbox", bbox_lines, mat)
+        scene.scene.add_geometry("bbox", bbox_lines, mat_line)
         # 信息文本
         bb = new_tri.bounds
         ext = bb[1]-bb[0]
@@ -529,7 +651,7 @@ def cmd_gui(args):
         add_slider('axis.ry(deg)', -180, 180, 0.0, lambda v: set_axis_from_euler(ry_deg=v))
         add_slider('axis.rz(deg)', -180, 180, 0.0, lambda v: set_axis_from_euler(rz_deg=v))
 
-    elif t == 'box':
+    elif t == 'cuboid':
         ex, ey, ez = [float(x) for x in p['extents']]
         add_slider('extent.x', max(ex*0.1,1e-4), ex*3+1.0, ex, lambda v: _update_param(spec,'extents',[v, spec['params']['extents'][1], spec['params']['extents'][2]]))
         add_slider('extent.y', max(ey*0.1,1e-4), ey*3+1.0, ey, lambda v: _update_param(spec,'extents',[spec['params']['extents'][0], v, spec['params']['extents'][2]]))
@@ -554,47 +676,87 @@ def cmd_gui(args):
     panel.add_child(info)
 
     # 布局
-    horiz = gui.Horiz()
-    horiz.add_child(scene, stretch=4)
-    scroll = gui.ScrollView(panel)
-    horiz.add_child(scroll, stretch=1)
+    # —— 新布局：优先用 Splitter，失败则用 on_layout —— 
+    if hasattr(gui, "Splitter"):
+        splitter = gui.Splitter(gui.Splitter.HORIZONTAL)
+        splitter.add_child(scene)
 
-    w.add_child(horiz)
+        # 有的构建没有 ScrollView：前面你已经做了兼容，变量名统一用 scroll_or_panel
+        right = scroll_or_panel if 'scroll_or_panel' in locals() else panel
+        splitter.add_child(right)
+
+        # 初始分割比：左 75% / 右 25%
+        # 注意：需要在窗口布局完成后设置一次
+        def _on_layout(_):
+            r = w.content_rect
+            splitter.frame = r
+            splitter.set_divider_position(int(r.width * 0.75))
+        w.set_on_layout(_on_layout)
+
+        w.add_child(splitter)
+
+    else:
+        # 极限降级（没有 Splitter）：手动 on_layout
+        # 把 scene 放左侧 75%，右侧放 panel
+        w.add_child(scene)
+        right = scroll_or_panel if 'scroll_or_panel' in locals() else panel
+        w.add_child(right)
+
+        def _on_layout(_):
+            r = w.content_rect
+            left_w = int(r.width * 0.75)
+            scene.frame = gui.Rect(r.x, r.y, left_w, r.height)
+            right.frame = gui.Rect(r.x + left_w, r.y, r.width - left_w, r.height)
+        w.set_on_layout(_on_layout)
+
+
     refresh_geometry()
 
     app.run()
 
 
 if __name__ == '__main__':
-    ap = argparse.ArgumentParser(description='STL 参数化拟合与生成 (sphere/cylinder/box)')
+    geometry = "cuboid" # 可选 sphere/cylinder/cuboid
+
+    model_path = f"models/{geometry}.STL"
+    json_path = f"jsons/{geometry}.json"
+    out_path = f"outs/{geometry}.stl"
+    prefer = geometry
+    forceType = geometry
+
+    ap = argparse.ArgumentParser(description='STL 参数化拟合与生成 (sphere/cylinder/cuboid)')
     sub = ap.add_subparsers(required=True)
 
     p_fit = sub.add_parser('fit', help='从 STL 拟合并导出 JSON 参数')
-    p_fit.add_argument('--stl', default="models/sphere.STL", required=True)
-    p_fit.add_argument('--json', default="jsons/sphere.json", required=True)
+    p_fit.add_argument('--stl', default=model_path)
+    p_fit.add_argument('--json', default=json_path)
     p_fit.add_argument('--samples', type=int, default=200000)
-    p_fit.add_argument('--preview', action='store_true')
+    p_fit.add_argument('--preview', default=True, action='store_true')
     p_fit.add_argument('--flat', action='store_true', help='禁用平滑着色（避免依赖 networkx/scipy）')
+    p_fit.add_argument('--force-type', default=geometry, choices=['sphere', 'cylinder', 'cuboid'],
+                   help='强制拟合为指定类型（跳过自动判别）')
+    p_fit.add_argument('--prefer', default=geometry, choices=['sphere', 'cylinder', 'cuboid'],
+                    help='当残差接近时优先此类型')
     p_fit.set_defaults(func=cmd_fit)
 
     p_gen = sub.add_parser('gen', help='从 JSON 生成新网格，支持用 --set 修改参数')
-    p_gen.add_argument('--json', default="jsons/sphere.json", required=True)
+    p_gen.add_argument('--json', default=json_path)
     p_gen.add_argument('--set', nargs='*', default=[], help='形如 key=val，例如 radius=2.5 或 extents=[2,3,4]')
-    p_gen.add_argument('--out', default="outs/sphere.stl", help='输出新 STL/OBJ 路径，后缀决定格式')
+    p_gen.add_argument('--out', default=out_path, help='输出新 STL/OBJ 路径，后缀决定格式')
     p_gen.add_argument('--preview', action='store_true')
     p_gen.add_argument('--flat', action='store_true', help='禁用平滑着色（避免依赖 networkx/scipy）')
     p_gen.set_defaults(func=cmd_gen)
 
     p_prev = sub.add_parser('preview', help='可视化原始 STL 与 JSON 拟合模型')
-    p_prev.add_argument('--stl', default="models/sphere.STL")
-    p_prev.add_argument('--json', default="jsons/sphere.json")
+    p_prev.add_argument('--stl', default=model_path)
+    p_prev.add_argument('--json', default=json_path)
     p_prev.add_argument('--flat', action='store_true', help='禁用平滑着色（避免依赖 networkx/scipy）')
     p_prev.set_defaults(func=cmd_preview)
 
     # 交互 GUI 子命令（Open3D）
     p_gui = sub.add_parser('gui', help='Open3D 交互式预览，带滑块调参与坐标轴/尺寸标注')
-    p_gui.add_argument('--json', default="jsons/sphere.json", help='参数 JSON 文件')
-    p_gui.add_argument('--stl', default="models/sphere.STL", help='可选：原始 STL（作为参考线框或实体）')
+    p_gui.add_argument('--json', default=json_path, help='参数 JSON 文件')
+    p_gui.add_argument('--stl', default=model_path, help='可选：原始 STL（作为参考线框或实体）')
     p_gui.add_argument('--samples', type=int, default=80000, help='若传入 --stl 用于抽样显示')
     p_gui.set_defaults(func=cmd_gui)
 
