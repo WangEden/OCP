@@ -6,23 +6,27 @@ STL 参数化拟合（球/圆柱/长方体）→ 导出 JSON → 基于 JSON 参
 依赖：
   - numpy
   - trimesh
-
-（可选可视化更好看）
-  - pyglet 或 pyopengl 作为 trimesh 后端二选一
+  - open3d
 
 安装示例：
-  pip install numpy trimesh pyglet
+  pip install numpy trimesh pyglet open3d
 
 用法：
   1) 从 STL 拟合并导出 JSON：
-     python stl_param_fit.py fit --stl input.stl --json params.json --samples 200000
+     python main.py fit --stl input.stl --json params.json --samples 200000
+     或 python main.py fit
 
   2) 从 JSON 修改参数并生成新网格（并可视化）：
-     python stl_param_fit.py gen --json params.json --set radius=2.5 height=8.0 \
+     python main.py gen --json params.json --set radius=2.5 height=8.0 \
                                   --out new.stl --preview
+     或 python main.py gen
 
   3) 直接可视化：
-     python stl_param_fit.py preview --stl input.stl --json params.json
+     python main.py preview --stl input.stl --json params.json
+
+  4) GUI 交互调参（需要 Open3D 支持 GUI 的版本）：
+     python main.py gui --stl input.stl --json params.json --samples 50000
+     或 python main.py gui
 
 说明：
   - 本脚本不依赖 OCC/OpenCascade；仅用 numpy+trimesh 做解析与可视化。
