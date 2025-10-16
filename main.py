@@ -731,7 +731,7 @@ def cmd_gui(args):
 
 
 if __name__ == '__main__':
-    geometry = "cuboid" # 可选 sphere/cylinder/cuboid
+    geometry = "cylinder" # 可选 sphere/cylinder/cuboid
 
     model_path = f"models/{geometry}.STL"
     json_path = f"jsons/{geometry}.json"
