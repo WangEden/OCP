@@ -47,6 +47,68 @@ import numpy as np
 import trimesh
 
 # ----------------------- 工具函数 -----------------------
+def read_plot3d_xyz(path: str, order: str = "xzy"):
+    """
+    读取简单的 ASCII Plot3D 多块文件。
+    参数 order 指明写入顺序：大多数是 'xyz'，但 waverider.py 写的是 'xzy'。
+    返回 [(X, Y, Z), ...]；每个是 (nk, nj, ni) 的 ndarray（一般 nk=1 表面）
+    """
+    import numpy as np
+    with open(path, 'r') as f:
+        toks = f.read().split()
+    it = iter(toks)
+    nblk = int(next(it))
+    dims = []
+    for _ in range(nblk):
+        ni, nj, nk = int(next(it)), int(next(it)), int(next(it))
+        dims.append((ni, nj, nk))
+
+    blocks = []
+    for (ni, nj, nk) in dims:
+        size = ni * nj * nk
+        A = np.fromiter((float(next(it)) for _ in range(size)), float, count=size).reshape((nk, nj, ni))
+        B = np.fromiter((float(next(it)) for _ in range(size)), float, count=size).reshape((nk, nj, ni))
+        C = np.fromiter((float(next(it)) for _ in range(size)), float, count=size).reshape((nk, nj, ni))
+        if order.lower() == "xyz":
+            X, Y, Z = A, B, C
+        elif order.lower() == "xzy":
+            X, Y, Z = A, C, B   # waverider.py 用的就是这个顺序
+        else:
+            raise ValueError("Unknown order, expect 'xyz' or 'xzy'")
+        blocks.append((X, Y, Z))
+    return blocks
+
+
+def plot3d_blocks_to_trimesh(blocks):
+    """
+    把 Plot3D 结构网格曲面（三维阵列 nk×nj×ni，通常 nk=1）转成 trimesh 三角网格。
+    支持多块：合并成一体。
+    """
+    import numpy as np, trimesh
+    all_vertices = []
+    all_faces = []
+    v_offset = 0
+    for (X, Y, Z) in blocks:
+        X, Y, Z = X[0], Y[0], Z[0]   # 取 nk=1 的曲面层 → (nj, ni)
+        nj, ni = X.shape
+        V = np.stack([X, Y, Z], axis=-1).reshape(-1, 3)  # (nj*ni, 3)
+        all_vertices.append(V)
+
+        # 逐网格单元剖分为两三角（i: 0..ni-2, j: 0..nj-2）
+        ii, jj = np.meshgrid(np.arange(ni-1), np.arange(nj-1))
+        ii = ii.ravel(); jj = jj.ravel()
+        # 顶点索引（行主序）
+        def vid(j, i): return j*ni + i
+        f1 = np.stack([vid(jj, ii), vid(jj, ii+1), vid(jj+1, ii+1)], axis=1)
+        f2 = np.stack([vid(jj, ii), vid(jj+1, ii+1), vid(jj+1, ii)], axis=1)
+        F = np.vstack([f1, f2]).astype(np.int64) + v_offset
+        all_faces.append(F)
+        v_offset += V.shape[0]
+
+    V_all = np.vstack(all_vertices)
+    F_all = np.vstack(all_faces) if all_faces else np.zeros((0, 3), dtype=np.int64)
+    return trimesh.Trimesh(vertices=V_all, faces=F_all, process=False)
+
 
 def load_points_from_stl(stl_path: str, n_samples: int = 200_000) -> Tuple[np.ndarray, trimesh.Trimesh]:
     """读取 STL 并从表面均匀采样点.
@@ -730,6 +792,24 @@ def cmd_gui(args):
     app.run()
 
 
+def cmd_preview_plot3d(args):
+    import trimesh
+    # 汇总多个 .xyz（例如上/下表面），并可选不同顺序
+    meshes = []
+    for p in args.xyz:
+        blocks = read_plot3d_xyz(p, order=args.order)
+        meshes.append(plot3d_blocks_to_trimesh(blocks))
+    merged = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
+    if args.out:
+        merged.export(args.out)
+        print(f"Saved mesh → {args.out}")
+    # 复用现有的 Open3D 预览管线（与你的 preview/gen 一致）
+    preview_scene(None, merged, smooth=not getattr(args, 'flat', False))
+
+
+
+
+
 if __name__ == '__main__':
     geometry = "cylinder" # 可选 sphere/cylinder/cuboid
 
@@ -774,6 +854,14 @@ if __name__ == '__main__':
     p_gui.add_argument('--stl', default=model_path, help='可选：原始 STL（作为参考线框或实体）')
     p_gui.add_argument('--samples', type=int, default=80000, help='若传入 --stl 用于抽样显示')
     p_gui.set_defaults(func=cmd_gui)
+
+    p_p3d = sub.add_parser('preview_plot3d', help='预览 Plot3D (.xyz) 曲面（支持多个文件合并显示）')
+    p_p3d.add_argument('--xyz', nargs='+', required=True, help='一个或多个 Plot3D .xyz 路径（可传上下表面）')
+    p_p3d.add_argument('--order', default='xzy', choices=['xyz','xzy'],
+                    help='文件内坐标写入顺序（waverider.py 输出是 xzy）')
+    p_p3d.add_argument('--out', default=None, help='可选：把合并后的网格导出为 STL/OBJ')
+    p_p3d.add_argument('--flat', action='store_true', help='禁用平滑着色')
+    p_p3d.set_defaults(func=cmd_preview_plot3d)
 
     args = ap.parse_args()
     args.func(args)
