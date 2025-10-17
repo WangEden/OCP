@@ -41,7 +41,8 @@ import argparse
 import json
 import math
 from dataclasses import dataclass, asdict
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List
+from waverider import Conical_flow, streamline
 
 import numpy as np
 import trimesh
@@ -128,6 +129,76 @@ def load_points_from_stl(stl_path: str, n_samples: int = 200_000) -> Tuple[np.nd
     return pts, mesh
 
 
+def load_mesh_as_trimesh(path: str) -> trimesh.Trimesh:
+    """
+    把各种可能的 STL 载入结果（Scene / list / Trimesh）统一成单个 Trimesh。
+    """
+    m = trimesh.load(path, force='mesh')
+    # 1) 如果是 Scene
+    if hasattr(m, 'geometry'):
+        geoms = [g for g in m.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        if not geoms:
+            raise RuntimeError(f"No mesh geometry found in scene: {path}")
+        return trimesh.util.concatenate(geoms)
+
+    # 2) 如果是 list[Trimesh]
+    if isinstance(m, (list, tuple)):
+        geoms = [g for g in m if isinstance(g, trimesh.Trimesh)]
+        if not geoms:
+            raise RuntimeError(f"No trimesh in list for: {path}")
+        return trimesh.util.concatenate(geoms)
+
+    # 3) 已经是 Trimesh
+    if isinstance(m, trimesh.Trimesh):
+        return m
+
+    # 4) 防御：如果是 numpy 数组，无法直接用 —— 明确报错
+    if isinstance(m, np.ndarray):
+        raise TypeError("Loaded object is numpy.ndarray, expected a triangulated mesh. "
+                        "Please provide an STL with faces.")
+
+    # 兜底
+    raise TypeError(f"Unsupported mesh type: {type(m)} from {path}")
+
+
+def _split_upper_lower_from_stl(mesh: trimesh.Trimesh, ny_thresh=0.98):
+    """
+    通过法向把一个 Trimesh 分为上/下表面。
+    传入的 mesh 必须是 Trimesh（如果不是，请先用 load_mesh_as_trimesh）。
+    """
+    if not isinstance(mesh, trimesh.Trimesh):
+        raise TypeError(f"_split_upper_lower_from_stl expects Trimesh, got {type(mesh)}")
+
+    m = mesh.copy()
+    m.rezero()
+    fn = m.face_normals  # (F,3)
+    # 上表面：法向的 y 分量绝对值很大（近似平行 ±Y）
+    upper_mask = np.abs(fn[:, 1]) >= ny_thresh
+
+    faces_up = np.nonzero(upper_mask)[0]
+    faces_lo = np.nonzero(~upper_mask)[0]
+
+    if len(faces_up) == 0 or len(faces_lo) == 0:
+        # 放宽阈值再试一次
+        upper_mask = np.abs(fn[:, 1]) >= 0.95
+        faces_up = np.nonzero(upper_mask)[0]
+        faces_lo = np.nonzero(~upper_mask)[0]
+        if len(faces_up) == 0 or len(faces_lo) == 0:
+            raise RuntimeError("Failed to split upper/lower surfaces by normals; "
+                               "try cleaning normals or adjust --ny-thresh.")
+
+    up = m.submesh([faces_up], append=True)
+    lo = m.submesh([faces_lo], append=True)
+
+    # 如果是多连通，取面积最大的一块
+    if isinstance(up, list):
+        up = max(up, key=lambda g: g.area)
+    if isinstance(lo, list):
+        lo = max(lo, key=lambda g: g.area)
+
+    return up, lo
+
+
 def pca_axes(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """对点云做 PCA，返回 (centroid, R)；R 的行向量是主轴 (x',y',z')."""
     c = points.mean(axis=0)
@@ -161,16 +232,201 @@ class BoxParam:
     extents: Tuple[float, float, float]  # 沿主轴长度 (lx, ly, lz)
 
 @dataclass
-class WaveRiderParam:
-    # center: Tuple[float, float, float]
-    # axis: Tuple[float, float, float]
-    # radius: float
-    # height: float
-    # wave_amplitude: float
-    # wave_length: float
-    # wave_phase: float
-    pass
+class WaveriderParams:
+    Ma: float = 6.0
+    shock_angle_deg: float = 30.0
+    n_arcs: int = 3
+    phi_arc_deg: List[float] = None
+    R_arc: List[float] = None
+    zu: List[float] = None
+    yu: List[float] = None
+    n_stream: int = 600
+    n_out: int = 800
+    scale: float = 1.0
+    translate_x: float = 0.0
+    translate_y: float = 0.0
+    translate_z: float = 0.0
 
+def save_waverider_params_json(p: WaveriderParams, path: str):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(asdict(p), f, ensure_ascii=False, indent=2)
+
+def load_waverider_params_json(path: str) -> WaveriderParams:
+    with open(path, "r", encoding="utf-8") as f:
+        d = json.load(f)
+    return WaveriderParams(**d)
+
+def _split_upper_lower_from_stl(mesh: trimesh.Trimesh, ny_thresh=0.98) -> Tuple[trimesh.Trimesh, trimesh.Trimesh]:
+    """
+    通过法向分上/下表面：上表面接近 y 常量，法向 ~ ±ŷ（|ny| 大）。
+    ny_thresh 默认 0.98，必要时可调到 0.95。
+    """
+    mesh = mesh.copy()
+    mesh.rezero()
+    fn = mesh.face_normals  # (F,3)
+    upper_mask = np.abs(fn[:,1]) >= ny_thresh
+    # 取连通分量里最大的那一块，避免碎片
+    up = mesh.submesh([np.nonzero(upper_mask)[0]], append=True)
+    lo = mesh.submesh([np.nonzero(~upper_mask)[0]], append=True)
+    # 如果有多个组件，保留面积最大的
+    if isinstance(up, list): up = max(up, key=lambda m: m.area)
+    if isinstance(lo, list): lo = max(lo, key=lambda m: m.area)
+    return up, lo
+
+def _extract_upline_from_upper(upper: trimesh.Trimesh, tol=1e-4) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    上表面是 y,z 常量的条带：顶点的 (y,z) 成离散集合。
+    我们把 (y,z) 做网格化/去重，按 z 排序得到 (zu, yu)。
+    """
+    if not isinstance(upper, trimesh.Trimesh):
+        raise TypeError(f"_extract_upline_from_upper expects Trimesh, got {type(upper)}")
+    upper = ensure_trimesh(upper)
+    V = upper.vertices  # (N,3) → x,y,z
+    yz = V[:,[1,2]]
+    # 归一化后四舍五入聚类
+    scale = max(upper.extents) if upper.extents.max() > 0 else 1.0
+    q = np.round(yz / (tol*scale), 0)
+    # 唯一键
+    uniq, idx = np.unique(q, axis=0, return_index=True)
+    sel = yz[idx]
+    # 某些重复的 z 值可能对应不同 y（数值噪声），按 z 聚成条，只取众数 y
+    z_vals = sel[:,1]
+    order = np.argsort(z_vals)
+    sel = sel[order]
+    # 对相同 z（±tol*scale）求 y 的中位数
+    z_out, y_out = [], []
+    cur = []
+    for y,z in sel:
+        if (len(cur)==0) or (abs(z - cur[-1][1]) <= tol*scale):
+            cur.append((y,z))
+        else:
+            arr = np.array(cur); z_out.append(np.median(arr[:,1])); y_out.append(np.median(arr[:,0])); cur=[(y,z)]
+    if cur:
+        arr = np.array(cur); z_out.append(np.median(arr[:,1])); y_out.append(np.median(arr[:,0]))
+    zu = np.array(z_out, float)
+    yu = np.array(y_out, float)
+    # 去重并按 z 升序
+    ord2 = np.argsort(zu); zu = zu[ord2]; yu = yu[ord2]
+    return zu, yu
+
+def _extract_wavecurve_from_lower(lower: trimesh.Trimesh, k_percent=5, bins=200):
+    """
+    近似提取 (zw,yw)：在 x 最靠近鼻尖的一端（x 的最小若干百分位）投影到 (z,y) 平面，
+    再按 z 分箱取最大 y，得到一条“外轮廓”曲线（和 waverider 的波接触线一致性相当好）。
+    """
+    lower = ensure_trimesh(lower)
+    V = lower.vertices
+    x = V[:,0]; y = V[:,1]; z = V[:,2]
+    x_cut = np.percentile(x, k_percent)  # 取最靠前的若干点
+    mask = x <= x_cut
+    y2 = y[mask]; z2 = z[mask]
+    # 按 z 分箱
+    zmin, zmax = z2.min(), z2.max()
+    edges = np.linspace(zmin, zmax, bins+1)
+    inds = np.digitize(z2, edges) - 1
+    zw = []; yw = []
+    for i in range(bins):
+        m = inds == i
+        if m.any():
+            zw.append(0.5*(edges[i]+edges[i+1]))
+            yw.append(np.max(y2[m]))
+    return np.array(zw,float), np.array(yw,float)
+
+def _fit_piecewise_arcs(zw: np.ndarray, yw: np.ndarray, n_arcs: int):
+    """
+    与之前相同：把 (z_w, y_w) 按弧长等分 n_arcs 段，每段拟合圆（最小二乘），
+    得每段半径 R_i 与角跨度 phi_i（度）。
+    """
+    pts = np.stack([zw, yw], axis=1)
+    ds = np.sqrt(((np.diff(pts, axis=0))**2).sum(axis=1))
+    s = np.hstack([[0.0], np.cumsum(ds)])
+    cuts = np.linspace(0, s[-1], n_arcs+1)
+    R_list, phi_list = [], []
+    for k in range(n_arcs):
+        s0, s1 = cuts[k], cuts[k+1]
+        mask = (s >= s0) & (s <= s1)
+        seg = pts[mask]
+        if len(seg) < 3:
+            i0 = np.searchsorted(s, s0); i1 = min(len(pts), np.searchsorted(s, s1)+2)
+            seg = pts[max(0,i0-1):i1]
+        X = seg
+        A = np.c_[2*X[:,0], 2*X[:,1], np.ones(len(X))]
+        b = (X**2).sum(axis=1)
+        (a,b2,c), *_ = np.linalg.lstsq(A, b, rcond=None)
+        cx, cy = a, b2
+        R = float(np.sqrt(cx*cx + cy*cy + c))
+        ang = np.arctan2(seg[:,1]-cy, seg[:,0]-cx)
+        dphi = float(np.abs(ang[-1]-ang[0]) % (2*np.pi))
+        if dphi > np.pi: dphi = 2*np.pi - dphi
+        R_list.append(R); phi_list.append(np.degrees(dphi))
+    return np.array(phi_list), np.array(R_list)
+
+def waverider_from_params(p: WaveriderParams):
+    """
+    原样复刻你 waverider.py 的生成流程（见你脚本里 Conical_flow/streamline 的用法）。
+    返回 Upper_surface, Lower_surface，shape=(nj, ni, 3)
+    """
+    deg = np.pi/180.0
+    Ma = p.Ma
+    shockangle = p.shock_angle_deg * deg
+    n_arcs = int(p.n_arcs)
+    phi_arc = np.array([v*deg for v in p.phi_arc_deg], float)
+    R_arc = np.array(p.R_arc, float)
+
+    zw0 = np.zeros(n_arcs+1); yw0 = np.zeros(n_arcs+1); phi0 = np.zeros(n_arcs+1)
+    zc = np.zeros(n_arcs); yc = np.zeros(n_arcs)
+    for i in range(n_arcs):
+        phi0[i+1] = phi0[i] + phi_arc[i]
+        zw0[i+1] = zw0[i] + (np.sin(phi0[i+1])-np.sin(phi0[i]))*R_arc[i]
+        yw0[i+1] = yw0[i] + (-np.cos(phi0[i+1])+np.cos(phi0[i]))*R_arc[i]
+        zc[i] = zw0[i] - np.sin(phi0[i])*R_arc[i]
+        yc[i] = yw0[i] + np.cos(phi0[i])*R_arc[i]
+    for i in range(n_arcs):
+        yw0[i] -= yw0[n_arcs]
+        yc[i]  -= yw0[n_arcs]
+    yw0[n_arcs] = 0.0
+
+    zu = np.asarray(p.zu, float).copy()
+    yu = np.asarray(p.yu, float).copy()
+    nu = len(zu)
+    zu = zu * (zw0[n_arcs] / zu[-1]); yu = yu * (zw0[n_arcs] / zu[-1])
+
+    zw = np.zeros(nu); yw = np.zeros(nu); phiu = np.zeros(nu); Ru = np.zeros(nu); Rw = np.zeros(nu)
+    i = 0
+    for j in range(nu-1):
+        while (np.arctan((zu[j]-zc[i])/(yc[i]-yu[j])) - phi0[i] > phi_arc[i]) and (i < n_arcs-1):
+            i += 1
+        phiu[j] = np.arctan((zu[j]-zc[i])/(yc[i]-yu[j]))
+        zw[j] = zw0[i] + (np.sin(phiu[j]) - np.sin(phi0[i]))*R_arc[i]
+        yw[j] = yw0[i] + (-np.cos(phiu[j]) + np.cos(phi0[i]))*R_arc[i]
+        Rw[j] = R_arc[i]
+        Ru[j] = np.sqrt((zw[j]-zu[j])**2 + (yw[j]-yu[j])**2)
+    zw[nu-1] = zw0[n_arcs]; Rw[nu-1] = R_arc[n_arcs-1]
+
+    thetas, vxs, vys = Conical_flow(Ma, shockangle, n_out=p.n_out)
+    n_stream = int(p.n_stream)
+    Lower_surface = np.zeros((nu, n_stream, 3))
+    for ii in range(nu-1):
+        xs, ys = streamline(shockangle, Rw[ii], Ru[ii], n_stream, vxs, vys, thetas)
+        x0 = -xs[-1]; z0 = zu[ii]; y0 = yu[ii]
+        Lower_surface[ii,:,0] = x0 + xs
+        Lower_surface[ii,:,1] = y0 - ys*np.cos(phiu[ii])
+        Lower_surface[ii,:,2] = z0 + ys*np.sin(phiu[ii])
+    Lower_surface[nu-1,:,2] = zu[nu-1]
+
+    Upper_surface = np.zeros_like(Lower_surface)
+    for ii in range(nu):
+        Upper_surface[ii,:,0] = Lower_surface[ii,:,0]
+        Upper_surface[ii,:,1] = yu[ii]
+        Upper_surface[ii,:,2] = zu[ii]
+
+    # scale/translate
+    if p.scale != 1.0:
+        Lower_surface *= p.scale; Upper_surface *= p.scale
+    t = np.array([p.translate_x, p.translate_y, p.translate_z], float)
+    if np.linalg.norm(t) > 0:
+        Lower_surface += t; Upper_surface += t
+    return Upper_surface, Lower_surface
 
 def fit_sphere(points: np.ndarray) -> Tuple[SphereParam, float]:
     """解析法拟合球: x^2+y^2+z^2 + ax + by + cz + d = 0"""
@@ -608,18 +864,27 @@ def _normalize(v):
 
 
 def cmd_gui(args):
+    import os
     o3d, gui, rendering = _o3d_gui_modules()
 
     # 加载参数
-    with open(args.json, 'r', encoding='utf-8') as f:
-        spec = json.load(f)
+    has_spec = bool(getattr(args, "json", None)) and os.path.exists(args.json)
+    spec = None
+    if has_spec:
+        with open(args.json, 'r', encoding='utf-8') as f:
+            spec = json.load(f)
 
     orig_mesh = None
     if args.stl:
         _, orig_mesh = load_points_from_stl(args.stl, n_samples=min(args.samples, 50000))
 
     # 初始 mesh
-    tri = _spec_to_trimesh(spec)
+    tri = None
+    if has_spec:
+        tri = _spec_to_trimesh(spec)
+
+    if not has_spec and orig_mesh is None:
+        raise SystemExit("cmd_gui: 既没有 --json 也没有 --stl，无法展示。请至少提供一个。")
 
     # GUI 初始化
     app = gui.Application.instance
@@ -643,151 +908,171 @@ def cmd_gui(args):
         scene.scene.add_geometry("orig", o3, mat_mesh)
         scene.scene.show_geometry("orig", True)
 
-    tri_o3 = _trimesh_to_o3d(tri)
-    scene.scene.add_geometry("fit", tri_o3, mat_mesh)
+    if tri is not None:
+        tri_o3 = _trimesh_to_o3d(tri)
+        scene.scene.add_geometry("fit", tri_o3, mat_mesh)
 
     # 坐标轴与 bbox
-    size_hint = float(np.linalg.norm(tri.bounding_box.extents) if hasattr(tri, 'bounding_box') else 1.0)
-    axes = _make_axes(max(size_hint*0.25, 1e-3))
+    # size_hint = float(np.linalg.norm(tri.bounding_box.extents) if hasattr(tri, 'bounding_box') else 1.0)
+    # axes = _make_axes(max(size_hint*0.25, 1e-3))
+    # scene.scene.add_geometry("axes", axes, mat_line)
+
+    # bbox_lines = _bbox_lines_o3d(tri)
+    # scene.scene.add_geometry("bbox", bbox_lines, mat_line)
+
+    # # 相机
+    # bounds = scene.scene.bounding_box
+    # scene.setup_camera(60.0, bounds, bounds.get_center())
+
+    ref_mesh = tri if tri is not None else orig_mesh
+    size_hint = float(np.linalg.norm(ref_mesh.bounding_box.extents) if hasattr(ref_mesh, 'bounding_box') else 1.0)
+    axes = _make_axes(max(size_hint * 0.25, 1e-3))
     scene.scene.add_geometry("axes", axes, mat_line)
 
-    bbox_lines = _bbox_lines_o3d(tri)
+    bbox_lines = _bbox_lines_o3d(ref_mesh)
     scene.scene.add_geometry("bbox", bbox_lines, mat_line)
 
     # 相机
     bounds = scene.scene.bounding_box
     scene.setup_camera(60.0, bounds, bounds.get_center())
 
-    # 右侧面板（控件）
-    panel = gui.Vert(0, gui.Margins(8,8,8,8))
-    info = gui.Label("")
+    if has_spec:
+        # 右侧面板（控件）
+        panel = gui.Vert(0, gui.Margins(8,8,8,8))
+        info = gui.Label("")
 
-    def refresh_geometry():
-        nonlocal tri_o3, bbox_lines
-        # 重建拟合网格
-        new_tri = _spec_to_trimesh(spec)
-        new_o3 = _trimesh_to_o3d(new_tri)
-        scene.scene.remove_geometry("fit")
-        scene.scene.add_geometry("fit", new_o3, mat_mesh)
-        tri_o3 = new_o3
-        # bbox 更新
-        scene.scene.remove_geometry("bbox")
-        bbox_lines = _bbox_lines_o3d(new_tri)
-        scene.scene.add_geometry("bbox", bbox_lines, mat_line)
-        # 信息文本
-        bb = new_tri.bounds
-        ext = bb[1]-bb[0]
-        info.text = f"AABB: {ext[0]:.3f} × {ext[1]:.3f} × {ext[2]:.3f}  |  type: {spec['type']}"
+        def refresh_geometry():
+            nonlocal tri_o3, bbox_lines
+            # 重建拟合网格
+            new_tri = _spec_to_trimesh(spec)
+            new_o3 = _trimesh_to_o3d(new_tri)
+            scene.scene.remove_geometry("fit")
+            scene.scene.add_geometry("fit", new_o3, mat_mesh)
+            tri_o3 = new_o3
+            # bbox 更新
+            scene.scene.remove_geometry("bbox")
+            bbox_lines = _bbox_lines_o3d(new_tri)
+            scene.scene.add_geometry("bbox", bbox_lines, mat_line)
+            # 信息文本
+            bb = new_tri.bounds
+            ext = bb[1]-bb[0]
+            info.text = f"AABB: {ext[0]:.3f} × {ext[1]:.3f} × {ext[2]:.3f}  |  type: {spec['type']}"
 
-    # 根据类型创建滑块
-    sliders = []
-    def add_slider(name, vmin, vmax, vinit, on_change):
-        lbl = gui.Label(name)
-        sld = gui.Slider(gui.Slider.DOUBLE)
-        sld.set_limits(float(vmin), float(vmax))
-        sld.double_value = float(vinit)
-        def _cb(val):
-            on_change(float(val))
-            refresh_geometry()
-        sld.set_on_value_changed(_cb)
-        panel.add_child(lbl)
-        panel.add_child(sld)
-        sliders.append(sld)
-        return sld
+        # 根据类型创建滑块
+        sliders = []
+        def add_slider(name, vmin, vmax, vinit, on_change):
+            lbl = gui.Label(name)
+            sld = gui.Slider(gui.Slider.DOUBLE)
+            sld.set_limits(float(vmin), float(vmax))
+            sld.double_value = float(vinit)
+            def _cb(val):
+                on_change(float(val))
+                refresh_geometry()
+            sld.set_on_value_changed(_cb)
+            panel.add_child(lbl)
+            panel.add_child(sld)
+            sliders.append(sld)
+            return sld
 
-    t = spec['type']
-    p = spec['params']
+        t = spec['type']
+        p = spec['params']
 
-    # 公共：中心
-    cx, cy, cz = p.get('center', [0,0,0])
-    span = max(1.0, np.max(np.abs([cx,cy,cz]))*3 + 1.0)
-    add_slider('center.x', cx-span, cx+span, cx, lambda v: _update_param(spec,'center',[v, spec['params']['center'][1], spec['params']['center'][2]]))
-    add_slider('center.y', cy-span, cy+span, cy, lambda v: _update_param(spec,'center',[spec['params']['center'][0], v, spec['params']['center'][2]]))
-    add_slider('center.z', cz-span, cz+span, cz, lambda v: _update_param(spec,'center',[spec['params']['center'][0], spec['params']['center'][1], v]))
+        # 公共：中心
+        cx, cy, cz = p.get('center', [0,0,0])
+        span = max(1.0, np.max(np.abs([cx,cy,cz]))*3 + 1.0)
+        add_slider('center.x', cx-span, cx+span, cx, lambda v: _update_param(spec,'center',[v, spec['params']['center'][1], spec['params']['center'][2]]))
+        add_slider('center.y', cy-span, cy+span, cy, lambda v: _update_param(spec,'center',[spec['params']['center'][0], v, spec['params']['center'][2]]))
+        add_slider('center.z', cz-span, cz+span, cz, lambda v: _update_param(spec,'center',[spec['params']['center'][0], spec['params']['center'][1], v]))
 
-    if t == 'sphere':
-        r = float(p['radius'])
-        add_slider('radius', max(r*0.1, 1e-4), r*3+1.0, r, lambda v: _update_param(spec,'radius', v))
+        if t == 'sphere':
+            r = float(p['radius'])
+            add_slider('radius', max(r*0.1, 1e-4), r*3+1.0, r, lambda v: _update_param(spec,'radius', v))
 
-    elif t == 'cylinder':
-        r = float(p['radius']); h = float(p['height'])
-        ax = _normalize(p['axis'])
-        add_slider('radius', max(r*0.1, 1e-4), r*3+1.0, r, lambda v: _update_param(spec,'radius', v))
-        add_slider('height', max(h*0.1, 1e-4), h*3+1.0, h, lambda v: _update_param(spec,'height', v))
-        ang_init = [0.0, 0.0, 0.0]
-        def set_axis_from_euler(rx_deg=None, ry_deg=None, rz_deg=None):
-            nonlocal ang_init
-            if rx_deg is not None: ang_init[0] = rx_deg
-            if ry_deg is not None: ang_init[1] = ry_deg
-            if rz_deg is not None: ang_init[2] = rz_deg
-            Rx, Ry, Rz = [math.radians(a) for a in ang_init]
-            Rm = _euler_to_Rxyz(Rx, Ry, Rz)
-            new_axis = (Rm @ np.array([0,0,1.0])).tolist()
-            _update_param(spec,'axis', _normalize(new_axis).tolist())
-        add_slider('axis.rx(deg)', -180, 180, 0.0, lambda v: set_axis_from_euler(rx_deg=v))
-        add_slider('axis.ry(deg)', -180, 180, 0.0, lambda v: set_axis_from_euler(ry_deg=v))
-        add_slider('axis.rz(deg)', -180, 180, 0.0, lambda v: set_axis_from_euler(rz_deg=v))
+        elif t == 'cylinder':
+            r = float(p['radius']); h = float(p['height'])
+            ax = _normalize(p['axis'])
+            add_slider('radius', max(r*0.1, 1e-4), r*3+1.0, r, lambda v: _update_param(spec,'radius', v))
+            add_slider('height', max(h*0.1, 1e-4), h*3+1.0, h, lambda v: _update_param(spec,'height', v))
+            ang_init = [0.0, 0.0, 0.0]
+            def set_axis_from_euler(rx_deg=None, ry_deg=None, rz_deg=None):
+                nonlocal ang_init
+                if rx_deg is not None: ang_init[0] = rx_deg
+                if ry_deg is not None: ang_init[1] = ry_deg
+                if rz_deg is not None: ang_init[2] = rz_deg
+                Rx, Ry, Rz = [math.radians(a) for a in ang_init]
+                Rm = _euler_to_Rxyz(Rx, Ry, Rz)
+                new_axis = (Rm @ np.array([0,0,1.0])).tolist()
+                _update_param(spec,'axis', _normalize(new_axis).tolist())
+            add_slider('axis.rx(deg)', -180, 180, 0.0, lambda v: set_axis_from_euler(rx_deg=v))
+            add_slider('axis.ry(deg)', -180, 180, 0.0, lambda v: set_axis_from_euler(ry_deg=v))
+            add_slider('axis.rz(deg)', -180, 180, 0.0, lambda v: set_axis_from_euler(rz_deg=v))
 
-    elif t == 'cuboid':
-        ex, ey, ez = [float(x) for x in p['extents']]
-        add_slider('extent.x', max(ex*0.1,1e-4), ex*3+1.0, ex, lambda v: _update_param(spec,'extents',[v, spec['params']['extents'][1], spec['params']['extents'][2]]))
-        add_slider('extent.y', max(ey*0.1,1e-4), ey*3+1.0, ey, lambda v: _update_param(spec,'extents',[spec['params']['extents'][0], v, spec['params']['extents'][2]]))
-        add_slider('extent.z', max(ez*0.1,1e-4), ez*3+1.0, ez, lambda v: _update_param(spec,'extents',[spec['params']['extents'][0], spec['params']['extents'][1], v]))
-        def set_R_from_euler(rx_deg=None, ry_deg=None, rz_deg=None):
-            rx = getattr(set_R_from_euler, 'rx', 0.0)
-            ry = getattr(set_R_from_euler, 'ry', 0.0)
-            rz = getattr(set_R_from_euler, 'rz', 0.0)
-            if rx_deg is not None: rx = rx_deg
-            if ry_deg is not None: ry = ry_deg
-            if rz_deg is not None: rz = rz_deg
-            setattr(set_R_from_euler,'rx', rx)
-            setattr(set_R_from_euler,'ry', ry)
-            setattr(set_R_from_euler,'rz', rz)
-            Rm = _euler_to_Rxyz(math.radians(rx), math.radians(ry), math.radians(rz))
-            spec['params']['R'] = tuple(map(tuple, Rm.astype(float)))
-        add_slider('rot.rx(deg)', -180, 180, 0.0, lambda v: set_R_from_euler(rx_deg=v))
-        add_slider('rot.ry(deg)', -180, 180, 0.0, lambda v: set_R_from_euler(ry_deg=v))
-        add_slider('rot.rz(deg)', -180, 180, 0.0, lambda v: set_R_from_euler(rz_deg=v))
+        elif t == 'cuboid':
+            ex, ey, ez = [float(x) for x in p['extents']]
+            add_slider('extent.x', max(ex*0.1,1e-4), ex*3+1.0, ex, lambda v: _update_param(spec,'extents',[v, spec['params']['extents'][1], spec['params']['extents'][2]]))
+            add_slider('extent.y', max(ey*0.1,1e-4), ey*3+1.0, ey, lambda v: _update_param(spec,'extents',[spec['params']['extents'][0], v, spec['params']['extents'][2]]))
+            add_slider('extent.z', max(ez*0.1,1e-4), ez*3+1.0, ez, lambda v: _update_param(spec,'extents',[spec['params']['extents'][0], spec['params']['extents'][1], v]))
+            def set_R_from_euler(rx_deg=None, ry_deg=None, rz_deg=None):
+                rx = getattr(set_R_from_euler, 'rx', 0.0)
+                ry = getattr(set_R_from_euler, 'ry', 0.0)
+                rz = getattr(set_R_from_euler, 'rz', 0.0)
+                if rx_deg is not None: rx = rx_deg
+                if ry_deg is not None: ry = ry_deg
+                if rz_deg is not None: rz = rz_deg
+                setattr(set_R_from_euler,'rx', rx)
+                setattr(set_R_from_euler,'ry', ry)
+                setattr(set_R_from_euler,'rz', rz)
+                Rm = _euler_to_Rxyz(math.radians(rx), math.radians(ry), math.radians(rz))
+                spec['params']['R'] = tuple(map(tuple, Rm.astype(float)))
+            add_slider('rot.rx(deg)', -180, 180, 0.0, lambda v: set_R_from_euler(rx_deg=v))
+            add_slider('rot.ry(deg)', -180, 180, 0.0, lambda v: set_R_from_euler(ry_deg=v))
+            add_slider('rot.rz(deg)', -180, 180, 0.0, lambda v: set_R_from_euler(rz_deg=v))
 
-    panel.add_child(gui.Label(""))
-    panel.add_child(info)
+        panel.add_child(gui.Label(""))
+        panel.add_child(info)
 
-    # 布局
-    # —— 新布局：优先用 Splitter，失败则用 on_layout —— 
-    if hasattr(gui, "Splitter"):
-        splitter = gui.Splitter(gui.Splitter.HORIZONTAL)
-        splitter.add_child(scene)
+        # 布局
+        # —— 新布局：优先用 Splitter，失败则用 on_layout —— 
+        if hasattr(gui, "Splitter"):
+            splitter = gui.Splitter(gui.Splitter.HORIZONTAL)
+            splitter.add_child(scene)
 
-        # 有的构建没有 ScrollView：前面你已经做了兼容，变量名统一用 scroll_or_panel
-        right = scroll_or_panel if 'scroll_or_panel' in locals() else panel
-        splitter.add_child(right)
+            # 有的构建没有 ScrollView：前面你已经做了兼容，变量名统一用 scroll_or_panel
+            right = scroll_or_panel if 'scroll_or_panel' in locals() else panel
+            splitter.add_child(right)
 
-        # 初始分割比：左 75% / 右 25%
-        # 注意：需要在窗口布局完成后设置一次
-        def _on_layout(_):
-            r = w.content_rect
-            splitter.frame = r
-            splitter.set_divider_position(int(r.width * 0.75))
-        w.set_on_layout(_on_layout)
+            # 初始分割比：左 75% / 右 25%
+            # 注意：需要在窗口布局完成后设置一次
+            def _on_layout(_):
+                r = w.content_rect
+                splitter.frame = r
+                splitter.set_divider_position(int(r.width * 0.75))
+            w.set_on_layout(_on_layout)
 
-        w.add_child(splitter)
+            w.add_child(splitter)
 
+        else:
+            # 极限降级（没有 Splitter）：手动 on_layout
+            # 把 scene 放左侧 75%，右侧放 panel
+            w.add_child(scene)
+            right = scroll_or_panel if 'scroll_or_panel' in locals() else panel
+            w.add_child(right)
+
+            def _on_layout(_):
+                r = w.content_rect
+                left_w = int(r.width * 0.75)
+                scene.frame = gui.Rect(r.x, r.y, left_w, r.height)
+                right.frame = gui.Rect(r.x + left_w, r.y, r.width - left_w, r.height)
+            w.set_on_layout(_on_layout)
+
+        # 生成一次以更新 info
+        refresh_geometry()
     else:
-        # 极限降级（没有 Splitter）：手动 on_layout
-        # 把 scene 放左侧 75%，右侧放 panel
+        # —— 无 JSON：仅展示 STL，全屏场景，无滑块 —— 
         w.add_child(scene)
-        right = scroll_or_panel if 'scroll_or_panel' in locals() else panel
-        w.add_child(right)
-
         def _on_layout(_):
-            r = w.content_rect
-            left_w = int(r.width * 0.75)
-            scene.frame = gui.Rect(r.x, r.y, left_w, r.height)
-            right.frame = gui.Rect(r.x + left_w, r.y, r.width - left_w, r.height)
+            scene.frame = w.content_rect
         w.set_on_layout(_on_layout)
-
-
-    refresh_geometry()
 
     app.run()
 
@@ -807,7 +1092,68 @@ def cmd_preview_plot3d(args):
     preview_scene(None, merged, smooth=not getattr(args, 'flat', False))
 
 
+import os
 
+def cmd_wfit_stl(args):
+    # 读取 STL
+    mesh = load_mesh_as_trimesh(args.stl)
+    mesh = ensure_trimesh(mesh)
+    
+    # 分上/下
+    upper, lower = _split_upper_lower_from_stl(mesh, ny_thresh=args.ny_thresh)
+    # 提取 (zu,yu)
+    zu, yu = _extract_upline_from_upper(upper, tol=args.cluster_tol)
+    # 提取 (zw,yw)
+    zw, yw = _extract_wavecurve_from_lower(lower, k_percent=args.x_head_percent, bins=args.z_bins)
+    # 拟合扇形圆弧
+    phi_arc_deg, R_arc = _fit_piecewise_arcs(zw, yw, n_arcs=args.n_arcs)
+
+    p = WaveriderParams(
+        Ma=args.Ma, shock_angle_deg=args.shock,
+        n_arcs=args.n_arcs,
+        phi_arc_deg=[float(v) for v in phi_arc_deg],
+        R_arc=[float(v) for v in R_arc],
+        zu=[float(v) for v in zu],
+        yu=[float(v) for v in yu],
+        n_stream=args.n_stream, n_out=args.n_out,
+        scale=1.0
+    )
+    os.makedirs(os.path.dirname(args.json) or ".", exist_ok=True)
+    save_waverider_params_json(p, args.json)
+    print(f"[wfit_stl] saved → {args.json}")
+
+    if args.preview:
+        U, L = waverider_from_params(p)
+        blocks = [(U[None,:,:,0], U[None,:,:,1], U[None,:,:,2]),
+                  (L[None,:,:,0], L[None,:,:,1], L[None,:,:,2])]
+        mesh2 = plot3d_blocks_to_trimesh(blocks)
+        preview_scene(None, mesh2)
+
+
+def ensure_trimesh(obj) -> trimesh.Trimesh:
+    """
+    把 obj 统一成 Trimesh。
+    支持：
+      - Trimesh 直接返回
+      - (V,F) / [V,F] 其中 V=(N,3), F=(M,3) -> Trimesh
+      - list/tuple 的 Trimesh 集合 -> 合并
+    其余类型报错。
+    """
+    if isinstance(obj, trimesh.Trimesh):
+        return obj
+    if isinstance(obj, (list, tuple)):
+        # 1) list/tuple[Trimesh...] -> 合并
+        if all(isinstance(x, trimesh.Trimesh) for x in obj):
+            return trimesh.util.concatenate(list(obj))
+        # 2) (V,F)
+        if len(obj) == 2 and all(isinstance(x, np.ndarray) for x in obj):
+            V, F = obj
+            if V.ndim == 2 and V.shape[1] == 3 and F.ndim == 2 and F.shape[1] == 3:
+                return trimesh.Trimesh(vertices=V, faces=F, process=True)
+    # 3) 单个 ndarray 不支持（没有 faces）
+    if isinstance(obj, np.ndarray):
+        raise TypeError("Got a NumPy array (vertices) but no faces. Need a triangulated mesh.")
+    raise TypeError(f"Unsupported mesh type: {type(obj)}")
 
 
 if __name__ == '__main__':
@@ -818,6 +1164,9 @@ if __name__ == '__main__':
     out_path = f"outs/{geometry}.stl"
     prefer = geometry
     forceType = geometry
+
+    waverider_stl = "waverider/waverider_solid.stl"
+    waverider_json = "jsons/waverider_params.json"
 
     ap = argparse.ArgumentParser(description='STL 参数化拟合与生成 (sphere/cylinder/cuboid)')
     sub = ap.add_subparsers(required=True)
@@ -850,7 +1199,8 @@ if __name__ == '__main__':
 
     # 交互 GUI 子命令（Open3D）
     p_gui = sub.add_parser('gui', help='Open3D 交互式预览，带滑块调参与坐标轴/尺寸标注')
-    p_gui.add_argument('--json', default=json_path, help='参数 JSON 文件')
+    # p_gui.add_argument('--json', default=json_path, help='参数 JSON 文件')
+    p_gui.add_argument('--json', help='参数 JSON 文件')
     p_gui.add_argument('--stl', default=model_path, help='可选：原始 STL（作为参考线框或实体）')
     p_gui.add_argument('--samples', type=int, default=80000, help='若传入 --stl 用于抽样显示')
     p_gui.set_defaults(func=cmd_gui)
@@ -862,6 +1212,23 @@ if __name__ == '__main__':
     p_p3d.add_argument('--out', default=None, help='可选：把合并后的网格导出为 STL/OBJ')
     p_p3d.add_argument('--flat', action='store_true', help='禁用平滑着色')
     p_p3d.set_defaults(func=cmd_preview_plot3d)
+
+    # 注册 Waverider CLI
+    p_wfit_stl = sub.add_parser('wfit_stl', help='从 STL 拟合 waverider 参数并保存 JSON')
+    p_wfit_stl.add_argument('--stl', default=waverider_stl, help='输入 STL（建议是整机或半机；最好是刚缝合的 waverider）')
+    p_wfit_stl.add_argument('--n-arcs', type=int, default=3)
+    p_wfit_stl.add_argument('--Ma', type=float, default=6.0)
+    p_wfit_stl.add_argument('--shock', type=float, default=30.0)
+    p_wfit_stl.add_argument('--n-stream', type=int, default=600)
+    p_wfit_stl.add_argument('--n-out', type=int, default=800)
+    p_wfit_stl.add_argument('--json', default=waverider_json)
+    # 下面是 STL 解析的鲁棒参数
+    p_wfit_stl.add_argument('--ny-thresh', type=float, default=0.95, help='上表面判定阈值 |n·ŷ|≥此值')
+    p_wfit_stl.add_argument('--cluster-tol', type=float, default=5e-4, help='(y,z) 聚类公差（相对尺度）')
+    p_wfit_stl.add_argument('--x-head-percent', type=float, default=5.0, help='取最靠前 x 的百分位来估计波接触线')
+    p_wfit_stl.add_argument('--z-bins', type=int, default=200, help='(zw,yw) z 分箱数')
+    p_wfit_stl.add_argument('--preview', default=True, action='store_true')
+    p_wfit_stl.set_defaults(func=cmd_wfit_stl)
 
     args = ap.parse_args()
     args.func(args)
