@@ -116,6 +116,14 @@ def load_points_from_stl(stl_path: str, n_samples: int = 200_000) -> Tuple[np.nd
     返回 (N,3) 点云 和 原始 mesh 对象
     """
     mesh = trimesh.load(stl_path, force='mesh')
+
+    # mesh = trimesh.load("waverider_solid.stl", force='mesh')
+    # 将乘波体移到中心
+    # mesh.apply_translation(-mesh.bounding_box.centroid)   # AABB 中心移到原点
+    x_min = mesh.bounds[0][0]
+    mesh.apply_translation([-x_min, 0, 0])
+    # mesh.export("waverider_solid_centered.stl") # 测试输出
+
     if not isinstance(mesh, trimesh.Trimesh):
         # 有些 STL 可能是 Scene，做个合并
         if isinstance(mesh, trimesh.Scene):
